@@ -12,7 +12,7 @@
 * [Хештаблицы](heshtablitsi/README.md)
    * [Базовая структура](heshtablitsi/bazovaya_struktura.md)
    * [API хештаблиц](heshtablitsi/api_heshtablits.md)
-   * [Symtable and array API](heshtablitsi/symtable_and_array_api.md)
+   * [Symtable и API массивов](heshtablitsi/symtable_and_array_api.md)
    * [Алгоритм хеширования и коллизии](heshtablitsi/algoritm_heshirovaniya_i_kollizii.md)
 * Классы и объекты
    * Простые классы
