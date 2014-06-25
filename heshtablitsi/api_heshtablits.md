@@ -371,3 +371,224 @@ array(2) {
 }
 ```
 Этот результат выглядит похожим на результат работы `var_dump`. Если вы взглянете на код функции `php_var_dump()`, вы поймете, что там реализован аналогичный подход.
+
+##Итерирование
+Второй способ выполнить операцию над всеми значениями хэщ-таблицы это итерация через неё. Итерирование хэш-таблицы в C очень похоже на итерирование вручную в PHP:
+```
+<?php
+
+for (reset($array);
+     null !== $data = current($array);
+     next($array)
+) {
+    // Do something with $data
+}
+```
+Эквивалентный C-код для обзора массива выглядит так:
+```c
+zval **data;
+
+for (zend_hash_internal_pointer_reset(myht);
+     zend_hash_get_current_data(myht, (void **) &data) == SUCCESS;
+     zend_hash_move_forward(myht)
+) {
+    /* Do something with data */
+}
+```
+Сниппет выше использует внутренний указатель массива (`pInternalPointer`), обычно это плохая идея использовать его. Этот указатель является частью хэш-таблицы и он совместно используется всеми частями кода взаимодействующими с массивом. Например, вложенная итерация по хэш-таблице невозможна при использовании внутреннего указателя массива (так как один цикл изменит указатель другого).
+
+По этой причине все итерирующие функции используют второй вариант функций с суффикосм `_ex`, которые работают с внешним указателем позиции. При использовании этого API текущая позиция хранится в `HashPosition` (это просто typedef для `Bucket *`) и указатель на эту структуру передается последним аргументом во все функции:
+```c
+HashPosition pos;
+zval **data;
+
+for (zend_hash_internal_pointer_reset_ex(myht, &pos);
+     zend_hash_get_current_data_ex(myht, (void **) &data, &pos) == SUCCESS;
+     zend_hash_move_forward_ex(myht, &pos)
+) {
+    /* Do something with data */
+}
+```
+Также можно обходить хэш-таблицу в обратном направлении если использовать `end` вместо `reset` и `move_backwards` вместо `move_forward`:
+```c
+HashPosition pos;
+zval **data;
+
+for (zend_hash_internal_pointer_end_ex(myht, &pos);
+     zend_hash_get_current_data_ex(myht, (void **) &data, &pos) == SUCCESS;
+     zend_hash_move_backwards_ex(myht, &pos)
+) {
+    /* Do something with data */
+}
+```
+В дополнение вы можете извлечь ключ используя функцию `zend_hash_get_current_key_ex()`, у неё такая сигнатура:
+```c
+int zend_hash_get_current_key_ex(
+    const HashTable *ht, char **str_index, uint *str_length,
+    ulong *num_index, zend_bool duplicate, HashPosition *pos
+);
+```
+Эта функция возвращает тип ключа, который может принимать следующие значения:
+
+`HASH_KEY_IS_LONG`:
+    Ключ это целое число, которое может быть записано в `num_index`.
+`HASH_KEY_IS_STRING`:
+    Ключ это строка, которая может быть записана в `str_index`. Параметр `duplicate` определяет должен ли ключ записан напрямую или его нужн скопировать. Длина строки (еще раз подчеркиваем, что в этом контексте она включает нулевой байт) записывается в `str_length`.
+`HASH_KEY_NON_EXISTANT`:
+    Это значит, что мы при итерации достигли конца хэш-таблицы и в ней больше нет элементов. В циклах описанных выше этот случай невозможен.
+
+Для разбора различных возвращаемых значения эта функция обычно используется вннутри оператора `switch`:
+```с
+char *str_index;
+uint str_length;
+ulong num_index;
+
+switch (zend_hash_get_current_key_ex(myht, &str_index, &str_length, &num_index, 0, &pos)) {
+    case HASH_KEY_IS_LONG:
+        php_printf("%ld", num_index);
+        break;
+    case HASH_KEY_IS_STRING:
+        /* Subtracting 1 as the hashtable lengths include the NUL byte */
+        PHPWRITE(str_index, str_length - 1);
+        break;
+}
+```
+В PHP 5.5 есть дополнительная функция `zend_hash_get_current_key_zval_ex()`, которая упрощает запись ключа в zval:
+```c
+zval *key;
+MAKE_STD_ZVAL(key);
+zend_hash_get_current_key_zval_ex(myht, key, &pos);
+```
+##Копирование и объединение
+
+Копирование хэш-таблицы это еще одна частовстречающаяся операция. Обычно вы не должны длеать это вручную, так как PHP сделает это сам при возникновении копирования-при-записи. Копирование выполняется при помощи функции `zend_hash_copy()`:
+```c
+HashTable *ht_source = get_ht_from_somewhere();
+HashTable *ht_target;
+
+ALLOC_HASHTABLE(ht_target);
+zend_hash_init(ht_target, zend_hash_num_elements(ht_source), NULL, ZVAL_PTR_DTOR, 0);
+zend_hash_copy(ht_target, ht_source, (copy_ctor_func_t) zval_add_ref, NULL, sizeof(zval *));
+```
+Четвертый аргумент функции `zend_hash_copy()` больше не используется, он всегда должен иметь значение `NULL`. Третий аргумент — это *копирующий конструктор*, который будет вызван для каждого копируемого элемента. Для zval-ов это будет функция `zval_add_ref`, которая просто добавляет дополнительную ссылку ко всем элементам.
+
+Функция `zend_hash_copy()` работает и в случае если целевая хэш-таблица уже содержит элементы. Если ключ из `ht_source` уже существует в `ht_target`, то он будет перезаписан. Чтобы контролировать такое поведение может быть использована функция объединения  `zend_hash_merge()`, она имеет ту же сигнатуру что и `zend_hash_copy()`, но принимает дополнительный аргумент, который определяет должна или нет осуществляться перезапись.
+
+`zend_hash_merge(..., 0)` будет осуществлять копирование только эсли элемент с таким ключом не существует в целевой хэш-тиблице. `zend_hash_merge(..., 1)` ведет себя почти также как и `zend_hash_copy()`. Отличие только в том, что `merge` устанавливает внутренний указатель на первый эелмент (`pListHead`), а `copy` устанавливает его в то же значение что и в хэш-тиблице источнике.
+
+Для более полного контроля поведения при объединении хэш-таблиц может использоваться функция `zend_hash_merge_ex`, которая определяет какие элементы должны быть скопированы. Для этого используется специальная функция проверки (merge checker function):
+```c
+typedef zend_bool (*merge_checker_func_t)(
+    HashTable *target_ht, void *source_data, zend_hash_key *hash_key, void *pParam
+);
+```
+Функция проверки принимает целевую хэш-тиблицу, исходные данные, хэш ключа и дополнительный аргумент (такой же как в `zend_hash_apply_with_argument()`). Для примера давайте реализуем функцию, которая берет два массива, объединяет их и в случае коллизии ключей использует б*о*льшее значение:
+```c
+static int merge_greater(
+    HashTable *target_ht, zval **source_zv, zend_hash_key *hash_key, void *dummy
+) {
+    zval **target_zv;
+    zval compare_result;
+
+    if (zend_hash_quick_find(
+            target_ht, hash_key->arKey, hash_key->nKeyLength, hash_key->h, (void **) &target_zv
+        ) == FAILURE
+    ) {
+        /* Key does not exist in target hashtable, so copy in any case */
+        return 1;
+    }
+
+    /* Copy only if the source zval is greater (compare == 1) than the target zval */
+    compare_function(&compare_result, *source_zv, *target_zv);
+    return Z_LVAL(compare_result) == 1;
+}
+
+PHP_FUNCTION(array_merge_greater) {
+    zval *array1, *array2;
+
+    if (zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC, "aa", &array1, &array2) == FAILURE) {
+        return;
+    }
+
+    /* Copy array1 into return_value */
+    RETVAL_ZVAL(array1, 1, 0);
+
+    zend_hash_merge_ex(
+        Z_ARRVAL_P(return_value), Z_ARRVAL_P(array2), (copy_ctor_func_t) zval_add_ref,
+        sizeof(zval *), (merge_checker_func_t) merge_greater, NULL
+    );
+}
+```
+В основной функции сначала массив `array1` копируется в возвращаемое значениеи затем объединяется с `array2`. Здесь `array1` это целевой массив, к которому будут добавлены элементы `array2`. При объединении проверочная функция `merge_greater()` вызывается для всех элементов второго массива. Эта функция сначала пытается найти элемент с проверяемым ключом в первом массиве. Если такого элемента нет, то он будет скопирован из второго массива в первый. Если элемент есть, то он будет скопирован если значение во втором массиве больше чем в первом.
+
+Давайте проверим эту функцию:
+```c
+var_dump(array_merge_greater(
+    [3 => 0, "bar" => -5],
+    ["bar" => 5, "foo" => -10, 3 => -42]
+));
+// output:
+array(3) {
+  [3]=>
+  int(0)
+  ["bar"]=>
+  int(5)
+  ["foo"]=>
+  int(-10)
+}
+```
+##Сравнение, сортировка и экстремумы
+
+Последние три функции в API хэш-таблиц связаны с разного рода сравнением элементов хэш-таблицы друг с другом. Сравнение определено *функцией сравнения*:
+```c
+typedef int (*compare_func_t)(const void *left, const void *right TSRMLS_DC);
+```
+Эта функция принимает два элемента хэш-таблиц и возрвщает то, как они друг с другом соотносятся. Отрицательное число возвращается если `left < right`, положительное означает что `left > right`, 0 — элементы равны.
+
+Первая функция которую мы рассмотрим это `zend_hash_compare()`, она сравнивает 2 хэш-таблицы:
+```c
+int zend_hash_compare(
+    HashTable *ht1, HashTable *ht2, compare_func_t compar, zend_bool ordered TSRMLS_DC
+);
+```
+Возвращаемое значение имеет тот же смысл что и в описанной выше функции `compare_func_t`. Функция сначала сравнивает размеры массивов, если они отличаются, то массив с большим размером считается больше. То что происходит если массивы имеют одинаковый размер зависит от параметра `ordered`:
+
+Если `ordered=0` (порядок элементов не учитывается) функция пройдется по всем бакетам первой хэш-таблицы и попробует найти элемент с таким же ключом во второй. Если какого-то ключа нет, то первый массив будет считаться больше второго. Если все ключи есть, то функция сравнит значения.
+
+Если `ordered=1` (порядок элементов учитывается), то обе хэш-таблицы будут обходиться одновременно. Для каждого элемента сначала сравниваются ключи и если они совпадают, то сравниваются значения c использованием `compar`.
+
+Это продолжается до тех пор пока одна из операция сравнения вренет не нулевое значение (в таком случае результат сравнения  также будет результатом `zend_hash_compare()`) или пока не останется элементов для сравнения. В последнем случае хэш-таблицы будут считаться эквивалентными.
+
+Оба режима сравнения могут быть связаны с поведением в PHP операторов сравнения:
+```c
+/* $ar1 == $ar2 compares the elements with == and does not take order into account: */
+zend_hash_compare(ht1, ht2, (compare_func_t) hash_zval_compare_function, 0 TSRMLS_CC);
+
+/* $ar1 === $ar2 compares the elements with === and takes order into account: */
+zend_hash_compare(ht1, ht2, (compare_func_t) hash_zval_identical_function, 1 TSRMLS_CC);
+```
+
+Следующая функция, которую мы рассмотрим, `zend_hash_sort()`, она используется для сортировки хэш-таблицы:
+```c
+int zend_hash_sort(HashTable *ht, sort_func_t sort_func, compare_func_t compar, int renumber TSRMLS_DC);
+```
+Эта функция выполняет только пред- и постобработку хэш-таблицы, а саму сортировку делегирует функции переданной в `sort_func`:
+```с
+typedef void (*sort_func_t)(
+    void *buckets, size_t num_of_buckets, register size_t size_of_bucket,
+    compare_func_t compare_func TSRMLS_DC
+);
+```
+Функция получит массив бакетов, их число и размер (это всегда `sizeof(Bucket *)`), а также функцию сравнения. "Массив бакетов" здесь это обычный массив C, а не хэш-таблица. Функция сортировки пройдется по всем бакетам в этом массиве и переопределит их порядок.
+
+После того как функция сортировки завершит работу `zend_hash_sort()` переконструирует хэш-тиблицу на основе массива C. Если параметр `renumber=0`, то значения сохранят свои ключи и только поменяют порядок. Если `renumber=1`, то массив будет перенумерован и результирующая хэш-таблицыбудет иметь возрастающие челочисленные ключи.
+
+Пока вы не захотите реализовать собственный алгоритм сортировки будет использоваться функция `zend_qsort`, это PHP реализация алгоритма quicksort.
+
+Последняя среди функций связанных со сравниванием это функция поиска макисмального и минимального элементоы хэш-таблицы:
+```c
+int zend_hash_minmax(
+    const HashTable *ht, compare_func_t compar, int flag, void **pData TSRMLS_DC
+);
+```
+Если задан `flag=0`, то минимальное значение будетзаписано в `pData`, если задано `flag=1` — максимальное. Если хэш-таблица пуста, то функция вернет `FAILURE` (так как невозможно определить min/max aдля неправильно определенного или пустого массива).
